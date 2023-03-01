@@ -1,10 +1,11 @@
 package service
 
 import (
-	"fmt"
-	"strings"
-
 	"bytes"
+	_ "embed"
+	"fmt"
+	"github.com/spotahome/redis-operator/operator/redisfailover/service/tmp"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,14 +23,6 @@ import (
 const (
 	redisConfigurationVolumeName = "redis-config"
 	// Template used to build the Redis configuration
-	redisConfigTemplate = `slaveof 127.0.0.1 6379
-tcp-keepalive 60
-save 900 1
-save 300 10
-{{- range .Spec.Redis.CustomCommandRenames}}
-rename-command "{{.From}}" "{{.To}}"
-{{- end}}
-`
 	redisShutdownConfigurationVolumeName = "redis-shutdown-config"
 	redisReadinessVolumeName             = "redis-readiness-config"
 	redisStorageVolumeName               = "redis-data"
@@ -113,15 +106,17 @@ func generateSentinelConfigMap(rf *redisfailoverv1.RedisFailover, labels map[str
 	namespace := rf.Namespace
 
 	labels = util.MergeLabels(labels, generateSelectorLabels(sentinelRoleName, rf.Name))
-	sentinelConfigFileContent := `sentinel monitor mymaster %s 6379 2
-sentinel down-after-milliseconds mymaster 1000
-sentinel failover-timeout mymaster 3000
-# Only sentinel with version above 6.2 can resolve host names, but this is not enabled by default.
-sentinel resolve-hostnames yes
-# sentinel auth-pass mymaster $REDIS_PASSWORD
-sentinel parallel-syncs mymaster 2
 
-`
+	tmpl, err := template.New("sentinel").Parse(tmp.GetSentinelConfigFileContent())
+	if err != nil {
+		panic(err)
+	}
+
+	var tplOutput bytes.Buffer
+	if err := tmpl.Execute(&tplOutput, rf); err != nil {
+		panic(err)
+	}
+	sentinelConfigFileContent := tplOutput.String()
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -131,7 +126,8 @@ sentinel parallel-syncs mymaster 2
 			OwnerReferences: ownerRefs,
 		},
 		Data: map[string]string{
-			sentinelConfigFileName: fmt.Sprintf(sentinelConfigFileContent, fmt.Sprintf("rfr-%s-0.rfr-%s", rf.Name, rf.Name)),
+
+			sentinelConfigFileName: sentinelConfigFileContent,
 		},
 	}
 }
@@ -140,7 +136,7 @@ func generateRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string
 	name := GetRedisName(rf)
 	labels = util.MergeLabels(labels, generateSelectorLabels(redisRoleName, rf.Name))
 
-	tmpl, err := template.New("redis").Parse(redisConfigTemplate)
+	tmpl, err := template.New("redis").Parse(tmp.GetRedisConfigTemplate())
 	if err != nil {
 		panic(err)
 	}
@@ -151,10 +147,6 @@ func generateRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string
 	}
 
 	redisConfigFileContent := tplOutput.String()
-
-	if password != "" {
-		redisConfigFileContent = fmt.Sprintf("%s\nmasterauth %s\nrequirepass %s", redisConfigFileContent, password, password)
-	}
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -298,6 +290,7 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 					Containers: []corev1.Container{
 						{
 							Name:            "redis",
+							Args:            redisCommand,
 							Image:           rf.Spec.Redis.Image,
 							ImagePullPolicy: pullPolicy(rf.Spec.Redis.ImagePullPolicy),
 							Ports: []corev1.ContainerPort{
@@ -307,8 +300,25 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 									Protocol:      corev1.ProtocolTCP,
 								},
 							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "REDIS_PASSWORD",
+									Value: rf.Spec.Password,
+								},
+								{
+									Name: "POD_NAME",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "metadata.name",
+										},
+									},
+								},
+							},
 							VolumeMounts: volumeMounts,
-							Command:      redisCommand,
+							Command: []string{
+								"bash",
+								"-c",
+							},
 							ReadinessProbe: &corev1.Probe{
 								InitialDelaySeconds: graceTime,
 								TimeoutSeconds:      5,
@@ -456,7 +466,7 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 							Env: []corev1.EnvVar{
 								{
 									Name:  "REDIS_PASSWORD",
-									Value: "",
+									Value: rf.Spec.Password,
 								},
 								{
 									Name:  "REDIS_NODE",
@@ -527,6 +537,12 @@ done
 									Name:          "sentinel",
 									ContainerPort: 26379,
 									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "REDIS_PASSWORD",
+									Value: rf.Spec.Password,
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
@@ -848,13 +864,31 @@ func getRedisDataVolumeName(rf *redisfailoverv1.RedisFailover) string {
 	}
 }
 
+var shell = `
+if [[ $POD_NAME == rfr-{{ .Name }}-0 ]]; then
+  redis-server /redis/redis.conf 
+else
+	redis-server /redis/redis.conf slaveof rfr-{{ .Name }}-0.rfr-{{ .Name }} 6379
+fi
+`
+
 func getRedisCommand(rf *redisfailoverv1.RedisFailover) []string {
+	tmpl, err := template.New("redis").Parse(shell)
+	if err != nil {
+		panic(err)
+	}
+
+	var tplOutput bytes.Buffer
+	if err := tmpl.Execute(&tplOutput, rf); err != nil {
+		panic(err)
+	}
+
+	command := tplOutput.String()
 	if len(rf.Spec.Redis.Command) > 0 {
 		return rf.Spec.Redis.Command
 	}
 	return []string{
-		"redis-server",
-		fmt.Sprintf("/redis/%s", redisConfigFileName),
+		command,
 	}
 }
 
@@ -881,4 +915,20 @@ func getTerminationGracePeriodSeconds(rf *redisfailoverv1.RedisFailover) int64 {
 		return rf.Spec.Redis.TerminationGracePeriodSeconds
 	}
 	return 30
+}
+func getRedisEnv(rf *redisfailoverv1.RedisFailover) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	env = append(env, corev1.EnvVar{
+		Name:  "REDIS_PASSWORD",
+		Value: rf.Spec.Password,
+	})
+	return env
+}
+func getSentinelEnv(rf *redisfailoverv1.RedisFailover) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	env = append(env, corev1.EnvVar{
+		Name:  "REDIS_PASSWORD",
+		Value: rf.Spec.Password,
+	})
+	return env
 }
